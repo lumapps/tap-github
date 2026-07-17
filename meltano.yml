@@ -1,0 +1,68 @@
+version: 1
+send_anonymous_usage_stats: false
+project_id: 96584f7b-a36c-46e0-b41a-7f9074293137
+venv:
+  backend: uv
+plugins:
+  extractors:
+  - name: tap-github
+    namespace: tap_github
+    pip_url: -e .
+    capabilities:
+    - state
+    - catalog
+    - discover
+    settings:
+    - name: user_agent
+      kind: string
+    - name: metrics_log_level
+      kind: string
+    - name: auth_token
+      kind: password
+    - name: additional_auth_tokens
+      kind: array
+    - name: auth_app_keys
+      kind: array
+    - name: org_auth_app_keys
+      kind: object
+    - name: rate_limit_buffer
+      kind: integer
+    - name: expiry_time_buffer
+      kind: integer
+    - name: backoff_max_tries
+      kind: integer
+    - name: searches
+      kind: array
+    - name: organizations
+      kind: array
+    - name: repositories
+      kind: array
+    - name: user_usernames
+      kind: array
+    - name: user_ids
+      kind: array
+    - name: stream_options.milestones.state
+      kind: options
+      options:
+      - label: Open
+        value: open
+      - label: Closed
+        value: closed
+      - label: All
+        value: all
+    - name: start_date
+      kind: date_iso8601
+      value: '2010-01-01T00:00:00Z'
+    - name: stream_maps
+      kind: object
+    - name: stream_map_config
+      kind: object
+    select:
+    - '*.*'
+  loaders:
+  - name: target-jsonl
+    variant: andyh1203
+    pip_url: target-jsonl
+    config:
+      destination_path: .output
+      do_timestamp_file: true
