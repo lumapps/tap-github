@@ -45,6 +45,19 @@ class GitHubRestStream(RESTStream):
     # Set to True to use cursor-based pagination instead of page-based pagination
     use_cursor_pagination = False
 
+    # Shared by every GitHubRestStream instance/subclass in this process: once
+    # any stream trips the secondary (frequency-based) rate limit, we throttle
+    # all subsequent requests - from any stream - instead of resuming at the
+    # same pace that triggered it. Decays back down after a run of clean
+    # requests so a brief burst doesn't slow down an otherwise-healthy sync
+    # for the rest of the run. Reset each time the tap process starts.
+    _secondary_rate_limit_delay: ClassVar[float] = 0.0
+    _consecutive_clean_requests: ClassVar[int] = 0
+    _last_request_at: ClassVar[float | None] = None
+    _MIN_THROTTLE_DELAY: ClassVar[float] = 1.0  # seconds
+    _MAX_THROTTLE_DELAY: ClassVar[float] = 30.0  # seconds
+    _DECAY_AFTER_CLEAN_REQUESTS: ClassVar[int] = 25
+
     _authenticator: GitHubTokenAuthenticator | None = None
 
     @property
@@ -78,6 +91,72 @@ class GitHubRestStream(RESTStream):
             self.authenticator.set_organization(context["org"])
 
         yield from super().get_records(context)
+
+    def _throttle_before_request(self) -> None:
+        """Sleep if we're currently backing off from a secondary rate limit."""
+        delay = GitHubRestStream._secondary_rate_limit_delay
+        last_request_at = GitHubRestStream._last_request_at
+        GitHubRestStream._last_request_at = time.monotonic()
+        if delay <= 0 or last_request_at is None:
+            return
+        remaining = delay - (time.monotonic() - last_request_at)
+        if remaining > 0:
+            time.sleep(remaining)
+
+    def _note_clean_request(self) -> None:
+        """Gradually undo the throttle once requests stop tripping the limit."""
+        if GitHubRestStream._secondary_rate_limit_delay <= 0:
+            return
+        GitHubRestStream._consecutive_clean_requests += 1
+        if (
+            GitHubRestStream._consecutive_clean_requests
+            >= self._DECAY_AFTER_CLEAN_REQUESTS
+        ):
+            GitHubRestStream._consecutive_clean_requests = 0
+            halved = GitHubRestStream._secondary_rate_limit_delay / 2
+            GitHubRestStream._secondary_rate_limit_delay = (
+                halved if halved >= self._MIN_THROTTLE_DELAY else 0.0
+            )
+
+    def _register_secondary_rate_limit_hit(self) -> None:
+        """Ratchet up the shared inter-request delay after a secondary rate limit.
+
+        A single sleep-and-retry (see `validate_response`) only paces the one
+        request that got throttled; every other stream keeps firing at the
+        same rate that tripped the limit in the first place. This applies a
+        floor to the gap between *all* subsequent requests, tap-wide, until
+        enough clean requests go by to relax it again.
+        """
+        GitHubRestStream._consecutive_clean_requests = 0
+        current = GitHubRestStream._secondary_rate_limit_delay
+        new_delay = min(
+            self._MAX_THROTTLE_DELAY,
+            max(self._MIN_THROTTLE_DELAY, current * 2),
+        )
+        GitHubRestStream._secondary_rate_limit_delay = new_delay
+        self.logger.warning(
+            "Secondary (frequency) rate limit hit - throttling all requests "
+            f"in this run to >= {new_delay:.1f}s apart until things settle down."
+        )
+
+    def _request(
+        self,
+        prepared_request: requests.PreparedRequest,
+        context: Context | None,
+    ) -> requests.Response:
+        """Pace requests around the parent implementation.
+
+        Args:
+            prepared_request: The request to send.
+            context: Stream partition or context dictionary.
+
+        Returns:
+            The HTTP response.
+        """
+        self._throttle_before_request()
+        response = super()._request(prepared_request, context)
+        self._note_clean_request()
+        return response
 
     def get_next_page_token(
         self,
@@ -261,6 +340,7 @@ class GitHubRestStream(RESTStream):
                 response.status_code == 403
                 and "secondary rate limit" in str(response.content).lower()
             ):
+                self._register_secondary_rate_limit_hit()
                 # Wait about a minute and retry
                 time.sleep(60 + 30 * random.random())
                 raise RetriableAPIError(msg, response)

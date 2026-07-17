@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import http
+import time
 from collections import defaultdict
 from typing import TYPE_CHECKING, Any, ClassVar
 from urllib.parse import parse_qs, urlparse
@@ -272,8 +273,83 @@ class RepositoryStream(GitHubRestStream):
                 "name": context["repo"],
                 "id": context["repo_id"],
             }
+        elif context is not None and (
+            "organizations" in self.config or "searches" in self.config
+        ):
+            # `organizations`/`searches` mode sorts by `updated_at`, in a stable,
+            # endpoint-imposed order that the "since" param can't actually filter
+            # (neither endpoint supports it). Every run therefore restarts at the
+            # same front-of-list repos, so once heavy child streams (commits,
+            # reviews) exhaust the secondary rate limit, repos further down the
+            # list are never reached. We round-robin instead: resume right after
+            # the last repo whose children fully synced last run, wrapping
+            # around at the end.
+            yield from self._get_records_round_robin(context)
         else:
             yield from super().get_records(context)
+
+    def _get_records_round_robin(self, context: Context) -> Iterable[dict[str, Any]]:
+        """Yield this partition's repos starting after the last completed one.
+
+        Traversal order is our own ascending sort by `id` (immutable), not the
+        API's `updated_at` order. `updated_at` shifts every run as repos see
+        real activity - the very thing this stream feeds downstream - so
+        resuming a position in an `updated_at`-sorted list keeps re-deriving a
+        different list to resume in. It never skips a repo (every repo the
+        API returns this run is still yielded exactly once), but each reshuffle
+        can push already-synced repos back in front of the resume point,
+        forcing a re-sync of their children before genuinely new repos are
+        reached. Sorting by `id` removes that churn entirely: new repos always
+        sort to the end (ids only increase), so the round-robin position is
+        undisturbed by anyone else's activity.
+        """
+        partition_label = context.get("org") or context.get("search_name") or self.name
+
+        all_records = list(super().get_records(context))
+        if not all_records:
+            self.logger.info(f"[{self.name}:{partition_label}] round-robin summary: 0 repos returned by the API.")
+            return
+
+        all_records.sort(key=lambda record: record["id"])
+
+        checkpoint = self.get_context_state(context).setdefault(
+            "round_robin_checkpoint", {}
+        )
+        last_repo_id = checkpoint.get("last_enumerated_repo_id")
+
+        start_index = 0
+        if last_repo_id is not None:
+            repo_ids = [record["id"] for record in all_records]
+            if last_repo_id in repo_ids:
+                start_index = (repo_ids.index(last_repo_id) + 1) % len(all_records)
+
+        ordered_records = all_records[start_index:] + all_records[:start_index]
+        started_at = time.monotonic()
+        processed = 0
+
+        # `finally` runs even on a mid-run crash: when an exception from
+        # child-stream syncing unwinds the outer sync loop, this generator is
+        # torn down (GeneratorExit thrown at the `yield` below) before the
+        # process exits, so the summary still gets logged either way.
+        try:
+            for record in ordered_records:
+                yield record
+                # Reached only once this record's child streams have fully synced
+                # (singer_sdk syncs children before pulling the next parent record).
+                checkpoint["last_enumerated_repo_id"] = record["id"]
+                checkpoint["last_enumerated_repo"] = record["full_name"]  # for readability in state.json
+                processed += 1
+                self._write_state_message()
+        finally:
+            full_lap = processed >= len(ordered_records)
+            self.logger.info(
+                f"[{self.name}:{partition_label}] round-robin summary: "
+                f"processed {processed}/{len(ordered_records)} repos in "
+                f"{time.monotonic() - started_at:.1f}s "
+                f"({'completed a full lap' if full_lap else 'stopped early - crash or run end'}); "
+                f"next run resumes after {checkpoint.get('last_enumerated_repo', 'n/a')} "
+                f"(id={checkpoint.get('last_enumerated_repo_id', 'n/a')})."
+            )
 
     schema = th.PropertiesList(
         th.Property("search_name", th.StringType),
