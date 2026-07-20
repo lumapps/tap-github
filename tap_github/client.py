@@ -1,0 +1,647 @@
+"""REST client handling, including GitHubStream base class."""
+
+from __future__ import annotations
+
+import email.utils
+import inspect
+import random
+import time
+from typing import TYPE_CHECKING, Any, ClassVar, cast
+from urllib.parse import parse_qs, urlparse
+
+from dateutil.parser import parse
+from nested_lookup import nested_lookup
+from singer_sdk.exceptions import FatalAPIError, RetriableAPIError
+from singer_sdk.helpers.jsonpath import extract_jsonpath
+from singer_sdk.streams import GraphQLStream, RESTStream
+
+from tap_github.authenticator import GitHubTokenAuthenticator
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
+    from types import FrameType
+
+    import requests
+    from backoff.types import Details
+    from singer_sdk.helpers.types import Context
+
+EMPTY_REPO_ERROR_STATUS = 409
+
+
+class GitHubRestStream(RESTStream):
+    """GitHub Rest stream class."""
+
+    MAX_PER_PAGE = 100  # GitHub's limit is 100.
+    MAX_RESULTS_LIMIT: int | None = None
+    DEFAULT_API_BASE_URL = "https://api.github.com"
+    LOG_REQUEST_METRIC_URLS = True
+
+    # GitHub is missing the "since" parameter on a few endpoints
+    # set this parameter to True if your stream needs to navigate data in descending order  # noqa: E501
+    # and try to exit early on its own.
+    # This only has effect on streams whose `replication_key` is `updated_at`.
+    use_fake_since_parameter = False
+
+    # Set to True to use cursor-based pagination instead of page-based pagination
+    use_cursor_pagination = False
+
+    # Shared by every GitHubRestStream instance/subclass in this process: once
+    # any stream trips the secondary (frequency-based) rate limit, we throttle
+    # all subsequent requests - from any stream - instead of resuming at the
+    # same pace that triggered it. Decays back down after a run of clean
+    # requests so a brief burst doesn't slow down an otherwise-healthy sync
+    # for the rest of the run. Reset each time the tap process starts.
+    _secondary_rate_limit_delay: ClassVar[float] = 0.0
+    _consecutive_clean_requests: ClassVar[int] = 0
+    _last_request_at: ClassVar[float | None] = None
+    _MIN_THROTTLE_DELAY: ClassVar[float] = 1.0  # seconds
+    _MAX_THROTTLE_DELAY: ClassVar[float] = 30.0  # seconds
+    _DECAY_AFTER_CLEAN_REQUESTS: ClassVar[int] = 25
+
+    _authenticator: GitHubTokenAuthenticator | None = None
+
+    @property
+    def authenticator(self) -> GitHubTokenAuthenticator:
+        if self._authenticator is None:
+            self._authenticator = GitHubTokenAuthenticator.from_stream(self)
+        return self._authenticator
+
+    @property
+    def url_base(self) -> str:
+        return self.config.get("api_url_base", self.DEFAULT_API_BASE_URL)
+
+    primary_keys: ClassVar[list[str]] = ["id"]
+    replication_key: str | None = None
+    tolerated_http_errors: ClassVar[list[int]] = []
+
+    @property
+    def http_headers(self) -> dict[str, str]:
+        """Return the http headers needed."""
+        headers = {"Accept": "application/vnd.github.v3+json"}
+        headers["User-Agent"] = cast("str", self.config.get("user_agent", "tap-github"))
+        return headers
+
+    def get_records(self, context: Context | None) -> Iterable[dict[str, Any]]:
+        """
+        Override parent method to set organization-specific authentication
+        before fetching records.
+        """
+        # Set organization-specific authentication before fetching records
+        if context is not None and "org" in context:
+            self.authenticator.set_organization(context["org"])
+
+        yield from super().get_records(context)
+
+    def _throttle_before_request(self) -> None:
+        """Sleep if we're currently backing off from a secondary rate limit."""
+        delay = GitHubRestStream._secondary_rate_limit_delay
+        last_request_at = GitHubRestStream._last_request_at
+        GitHubRestStream._last_request_at = time.monotonic()
+        if delay <= 0 or last_request_at is None:
+            return
+        remaining = delay - (time.monotonic() - last_request_at)
+        if remaining > 0:
+            time.sleep(remaining)
+
+    def _note_clean_request(self) -> None:
+        """Gradually undo the throttle once requests stop tripping the limit."""
+        if GitHubRestStream._secondary_rate_limit_delay <= 0:
+            return
+        GitHubRestStream._consecutive_clean_requests += 1
+        if (
+            GitHubRestStream._consecutive_clean_requests
+            >= self._DECAY_AFTER_CLEAN_REQUESTS
+        ):
+            GitHubRestStream._consecutive_clean_requests = 0
+            halved = GitHubRestStream._secondary_rate_limit_delay / 2
+            GitHubRestStream._secondary_rate_limit_delay = (
+                halved if halved >= self._MIN_THROTTLE_DELAY else 0.0
+            )
+
+    def _register_secondary_rate_limit_hit(self) -> None:
+        """Ratchet up the shared inter-request delay after a secondary rate limit.
+
+        A single sleep-and-retry (see `validate_response`) only paces the one
+        request that got throttled; every other stream keeps firing at the
+        same rate that tripped the limit in the first place. This applies a
+        floor to the gap between *all* subsequent requests, tap-wide, until
+        enough clean requests go by to relax it again.
+        """
+        GitHubRestStream._consecutive_clean_requests = 0
+        current = GitHubRestStream._secondary_rate_limit_delay
+        new_delay = min(
+            self._MAX_THROTTLE_DELAY,
+            max(self._MIN_THROTTLE_DELAY, current * 2),
+        )
+        GitHubRestStream._secondary_rate_limit_delay = new_delay
+        self.logger.warning(
+            "Secondary (frequency) rate limit hit - throttling all requests "
+            f"in this run to >= {new_delay:.1f}s apart until things settle down."
+        )
+
+    def _request(
+        self,
+        prepared_request: requests.PreparedRequest,
+        context: Context | None,
+    ) -> requests.Response:
+        """Pace requests around the parent implementation.
+
+        Args:
+            prepared_request: The request to send.
+            context: Stream partition or context dictionary.
+
+        Returns:
+            The HTTP response.
+        """
+        self._throttle_before_request()
+        response = super()._request(prepared_request, context)
+        self._note_clean_request()
+        return response
+
+    def get_next_page_token(
+        self,
+        response: requests.Response,
+        previous_token: Any | None,  # noqa: ANN401
+    ) -> Any | None:  # noqa: ANN401
+        """Return a token for identifying next page or None if no more pages."""
+        if (
+            previous_token
+            and self.MAX_RESULTS_LIMIT
+            and not self.use_cursor_pagination
+            and (
+                cast("int", previous_token) * self.MAX_PER_PAGE
+                >= self.MAX_RESULTS_LIMIT
+            )
+        ):
+            return None
+
+        # Leverage header links returned by the GitHub API.
+        if "next" not in response.links:
+            return None
+
+        resp_json = response.json()
+        results = (
+            resp_json
+            if isinstance(resp_json, list)
+            else list(extract_jsonpath(self.records_jsonpath, input=resp_json))
+        )
+
+        # Exit early if the response has no items. ? Maybe duplicative the "next" link check.  # noqa: E501
+        if not results:
+            return None
+
+        # Unfortunately endpoints such as /starred, /stargazers, /events and /pulls do not support  # noqa: E501
+        # the "since" parameter out of the box. So we use a workaround here to exit early.  # noqa: E501
+        # For such streams, we sort by descending dates (most recent first), and paginate  # noqa: E501
+        # "back in time" until we reach records before our "fake_since" parameter.
+        if self.replication_key and self.use_fake_since_parameter:
+            request_parameters = parse_qs(str(urlparse(response.request.url).query))
+            # parse_qs interprets "+" as a space, revert this to keep an aware datetime
+            try:
+                since = (
+                    request_parameters["fake_since"][0].replace(" ", "+")
+                    if "fake_since" in request_parameters
+                    else ""
+                )
+            except IndexError:
+                return None
+
+            direction = (
+                request_parameters["direction"][0]
+                if "direction" in request_parameters
+                else None
+            )
+
+            # commit_timestamp is a constructed key which does not exist in the raw response  # noqa: E501
+            replication_date = (
+                results[-1][self.replication_key]
+                if self.replication_key != "commit_timestamp"
+                else results[-1]["commit"]["committer"]["date"]
+            )
+            # exit early if the replication_date is before our since parameter
+            if (
+                since
+                and direction == "desc"
+                and (parse(replication_date) < parse(since))
+            ):
+                return None
+
+        # Handle cursor-based pagination
+        if self.use_cursor_pagination:
+            parsed_url = urlparse(response.links["next"]["url"])
+            captured_after_value_list = parse_qs(parsed_url.query).get("after")
+            return captured_after_value_list[0] if captured_after_value_list else None
+
+        # Use header links returned by the GitHub API for page-based pagination.
+        parsed_url = urlparse(response.links["next"]["url"])
+        captured_page_value_list = parse_qs(parsed_url.query).get("page")
+        next_page_string = (
+            captured_page_value_list[0] if captured_page_value_list else None
+        )
+        if next_page_string and next_page_string.isdigit():
+            return int(next_page_string)
+
+        return (previous_token or 1) + 1
+
+    def get_url_params(
+        self,
+        context: Context | None,
+        next_page_token: Any | None,  # noqa: ANN401
+    ) -> dict[str, Any]:
+        """Return a dictionary of values to be used in URL parameterization."""
+        params: dict = {"per_page": self.MAX_PER_PAGE}
+        if next_page_token:
+            if self.use_cursor_pagination:
+                params["after"] = next_page_token
+            else:
+                params["page"] = next_page_token
+
+        if self.replication_key == "updated_at":
+            params["sort"] = "updated"
+            params["direction"] = "desc" if self.use_fake_since_parameter else "asc"
+
+        # Unfortunately the /starred, /stargazers (starred_at) and /events (created_at) endpoints do not support  # noqa: E501
+        # the "since" parameter out of the box. But we use a workaround in 'get_next_page_token'.  # noqa: E501
+        elif self.replication_key in ["starred_at", "created_at"]:
+            params["sort"] = "created"
+            params["direction"] = "desc"
+
+        # Warning: /commits endpoint accept "since" but results are ordered by descending commit_timestamp  # noqa: E501
+        elif self.replication_key == "commit_timestamp":
+            params["direction"] = "desc"
+
+        elif self.replication_key:
+            self.logger.warning(
+                f"The replication key '{self.replication_key}' is not fully supported by this client yet."  # noqa: E501
+            )
+
+        since = self.get_starting_timestamp(context)
+        since_key = "since" if not self.use_fake_since_parameter else "fake_since"
+        if self.replication_key and since:
+            params[since_key] = since.isoformat(sep="T")
+            # Leverage conditional requests to save API quotas
+            # https://github.community/t/how-does-if-modified-since-work/139627
+            self.http_headers["If-modified-since"] = email.utils.format_datetime(since)
+        return params
+
+    def validate_response(self, response: requests.Response) -> None:
+        """Validate HTTP response.
+
+        In case an error is tolerated, continue without raising it.
+
+        In case an error is deemed transient and can be safely retried, then this
+        method should raise an :class:`singer_sdk.exceptions.RetriableAPIError`.
+
+        Args:
+            response: A `requests.Response`_ object.
+
+        Raises:
+            FatalAPIError: If the request is not retriable.
+            RetriableAPIError: If the request is retriable.
+
+        .. _requests.Response:
+            https://docs.python-requests.org/en/latest/api/#requests.Response
+        """
+        full_path = urlparse(response.url).path
+        if response.status_code in (
+            [
+                *self.tolerated_http_errors,
+                EMPTY_REPO_ERROR_STATUS,
+            ]
+        ):
+            msg = (
+                f"{response.status_code} Tolerated Status Code "
+                f"(Reason: {response.reason}) for path: {full_path}"
+            )
+            self.logger.info(msg)
+            return
+
+        github_request_id = response.headers.get("X-GitHub-Request-Id")
+
+        if 400 <= response.status_code < 500:
+            msg = (
+                f"{response.status_code} Client Error: "
+                f"{response.content!s} (Reason: {response.reason}) "
+                f"for path: {full_path} "
+                f"[GitHub-Request-Id: {github_request_id}]"
+            )
+            # Retry on rate limiting
+            if (
+                response.status_code == 403
+                and "rate limit exceeded" in str(response.content).lower()
+            ):
+                # Update token
+                self.authenticator.get_next_auth_token()
+                # Raise an error to force a retry with the new token.
+                raise RetriableAPIError(msg, response)
+
+            # Retry on secondary rate limit
+            if (
+                response.status_code == 403
+                and "secondary rate limit" in str(response.content).lower()
+            ):
+                self._register_secondary_rate_limit_hit()
+                # Wait about a minute and retry
+                time.sleep(60 + 30 * random.random())
+                raise RetriableAPIError(msg, response)
+
+            # The GitHub API randomly returns 401 Unauthorized errors, so we try again.
+            if (
+                response.status_code == 401
+                # if the token is invalid, we are also told about it
+                and "bad credentials" not in str(response.content).lower()
+            ):
+                raise RetriableAPIError(msg, response)
+
+            # The GitHub API can return transient 404 errors, e.g. due to
+            # replication lag or temporary unavailability. Retry these.
+            if response.status_code == 404:
+                raise RetriableAPIError(msg, response)
+
+            # all other errors are fatal
+            raise FatalAPIError(msg)
+
+        elif 500 <= response.status_code < 600:
+            msg = (
+                f"{response.status_code} Server Error: "
+                f"{response.content!s} (Reason: {response.reason}) "
+                f"for path: {full_path} "
+                f"[GitHub-Request-Id: {github_request_id}]"
+            )
+            raise RetriableAPIError(msg, response)
+
+    def parse_response(self, response: requests.Response) -> Iterable[dict]:
+        """Parse the response and return an iterator of result rows."""
+        # TODO - Split into handle_reponse and parse_response.
+        if response.status_code in (
+            [
+                *self.tolerated_http_errors,
+                EMPTY_REPO_ERROR_STATUS,
+            ]
+        ):
+            return
+
+        # Update token rate limit info and loop through tokens if needed.
+        self.authenticator.update_rate_limit(response.headers)
+
+        resp_json = response.json()
+
+        # Handle different response structures
+        if isinstance(resp_json, list):
+            # Direct array response
+            results = resp_json
+        else:
+            # Use records_jsonpath to extract records
+            results = list(extract_jsonpath(self.records_jsonpath, input=resp_json))
+
+            # Fallback: if no records found via jsonpath, treat the whole response as a
+            # single record
+            if not results:
+                results = [resp_json]
+
+        yield from results
+
+    def post_process(self, row: dict, context: Context | None = None) -> dict:
+        """Add `repo_id` by default to all streams."""
+        if context is not None and "repo_id" in context:
+            row["repo_id"] = context["repo_id"]
+        return row
+
+    def backoff_handler(self, details: Details) -> None:
+        """Handle retriable error by swapping auth token."""
+        self.logger.info("Retrying request with different token")
+        # use python introspection to obtain the error object
+        # FIXME: replace this once https://github.com/litl/backoff/issues/158
+        # is fixed
+        exc = cast(
+            "FrameType",
+            cast("FrameType", cast("FrameType", inspect.currentframe()).f_back).f_back,
+        ).f_locals["e"]
+        if (
+            exc.response is not None
+            and exc.response.status_code == 403
+            and "rate limit exceeded" in str(exc.response.content)
+        ):
+            # we hit a rate limit, rotate token
+            prepared_request = details["args"][0]
+            self.authenticator.get_next_auth_token()
+            prepared_request.headers.update(self.authenticator.auth_headers or {})
+
+    def backoff_max_tries(self) -> int:
+        """Return the maximum number of retry attempts."""
+        return self.config["backoff_max_tries"]
+
+    def calculate_sync_cost(
+        self,
+        request: requests.PreparedRequest,
+        response: requests.Response,
+        context: Context | None,
+    ) -> dict[str, int]:
+        """Return the cost of the last REST API call."""
+        return {"rest": 1, "graphql": 0, "search": 0}
+
+
+class GitHubDiffStream(GitHubRestStream):
+    """Base class for GitHub diff streams."""
+
+    # Known Github API errors for diff requests
+    tolerated_http_errors: ClassVar[list[int]] = [404, 406, 422, 500, 502, 504]
+
+    @property
+    def http_headers(self) -> dict:
+        """Return the http headers needed for diff requests."""
+        headers = super().http_headers
+        headers["Accept"] = "application/vnd.github.v3.diff"
+        return headers
+
+    def parse_response(self, response: requests.Response) -> Iterable[dict]:
+        """Parse the response to yield the diff text instead of an object
+        and prevent buffer overflow."""
+        if response.status_code != 200:
+            contents = response.json()
+            self.logger.info(
+                "Skipping %s due to %d error: %s",
+                self.name.replace("_", " "),
+                response.status_code,
+                contents["message"],
+            )
+            yield {
+                "success": False,
+                "error_message": contents["message"],
+            }
+            return
+
+        if content_length_str := response.headers.get("Content-Length"):
+            content_length = int(content_length_str)
+            max_size = 41_943_040  # 40 MiB
+            if content_length > max_size:
+                self.logger.info(
+                    "Skipping %s. The diff size (%.2f MiB) exceeded the maximum"
+                    " size limit of 40 MiB.",
+                    self.name.replace("_", " "),
+                    content_length / 1024 / 1024,
+                )
+                yield {
+                    "success": False,
+                    "error_message": "Diff exceeded the maximum size limit of 40 MiB.",
+                }
+                return
+
+        yield {"diff": response.text, "success": True}
+
+
+class GitHubGraphqlStream(GraphQLStream, GitHubRestStream):
+    """GitHub Graphql stream class."""
+
+    @property
+    def url_base(self) -> str:
+        return f"{self.config.get('api_url_base', self.DEFAULT_API_BASE_URL)}/graphql"
+
+    # the jsonpath under which to fetch the list of records from the graphql response
+    query_jsonpath: str = "$.data.[*]"
+
+    def parse_response(self, response: requests.Response) -> Iterable[dict]:
+        """Parse the response and return an iterator of result rows.
+
+        Args:
+            response: A raw `requests.Response`_ object.
+
+        Yields:
+            One item for every item found in the response.
+
+        .. _requests.Response:
+            https://docs.python-requests.org/en/latest/api/#requests.Response
+        """
+        resp_json = response.json()
+        for record in extract_jsonpath(self.query_jsonpath, input=resp_json):
+            if record is not None:
+                yield record
+
+    def get_next_page_token(
+        self,
+        response: requests.Response,
+        previous_token: Any | None,  # noqa: ANN401
+    ) -> Any | None:  # noqa: ANN401
+        """
+        Return a dict of cursors for identifying next page or None if no more pages.
+
+        Note - pagination requires the Graphql query to have nextPageCursor_X parameters
+        with the assosciated hasNextPage_X, startCursor_X and endCursor_X.
+
+        X should be an integer between 0 and 9, increasing with query depth.
+
+        Warning - we recommend to avoid using deep (nested) pagination.
+        """
+
+        resp_json = response.json()
+
+        # Find if results contains "hasNextPage_X" flags and if any are True.
+        # If so, set nextPageCursor_X to endCursor_X for X max.
+
+        next_page_results = nested_lookup(
+            key="hasNextPage_",
+            document=resp_json,
+            wild=True,
+            with_keys=True,
+        )
+
+        has_next_page_indices: list[int] = []
+        # Iterate over all the items and filter items with hasNextPage = True.
+        for key, value in next_page_results.items():
+            # Check if key is even then add pair to new dictionary
+            if any(value):
+                pagination_index = int(str(key).split("_")[1])
+                has_next_page_indices.append(pagination_index)
+
+        # Check if any "hasNextPage" is True. Otherwise, exit early.
+        if not len(has_next_page_indices) > 0:
+            return None
+
+        # Get deepest pagination item
+        max_pagination_index = max(has_next_page_indices)
+
+        # We leverage previous_token to remember the pagination cursors
+        # for indices below max_pagination_index.
+        next_page_cursors: dict[str, str] = {}
+        for key, value in (previous_token or {}).items():
+            # Only keep pagination info for indices below max_pagination_index.
+            pagination_index = int(str(key).split("_")[1])
+            if pagination_index < max_pagination_index:
+                next_page_cursors[key] = value
+
+        # Get the pagination cursor to update and increment it.
+        next_page_end_cursor_results = nested_lookup(
+            key=f"endCursor_{max_pagination_index}",
+            document=resp_json,
+        )
+
+        next_page_key = f"nextPageCursor_{max_pagination_index}"
+        next_page_cursor = next(
+            cursor for cursor in next_page_end_cursor_results if cursor is not None
+        )
+        next_page_cursors[next_page_key] = next_page_cursor
+
+        return next_page_cursors
+
+    def get_url_params(
+        self,
+        context: Context | None,
+        next_page_token: Any | None,  # noqa: ANN401
+    ) -> dict[str, Any]:
+        """Return a dictionary of values to be used in URL parameterization."""
+        params = dict(context) if context else {}
+        params["per_page"] = self.MAX_PER_PAGE
+        if next_page_token:
+            params.update(next_page_token)
+
+        since = self.get_starting_timestamp(context)
+        if self.replication_key and since:
+            params["since"] = since.isoformat(sep="T")
+
+        return params
+
+    def calculate_sync_cost(
+        self,
+        request: requests.PreparedRequest,
+        response: requests.Response,
+        context: Context | None,
+    ) -> dict[str, int]:
+        """Return the cost of the last graphql API call."""
+        costgen = extract_jsonpath("$.data.rateLimit.cost", input=response.json())
+        # calculate_sync_cost is called before the main response parsing.
+        # In some cases, the tap crashes here before we have been able to
+        # properly analyze where the error comes from, so we ignore these
+        # costs to allow figuring out what happened downstream, by setting
+        # them to 0.
+        cost = next(costgen, 0)
+        return {"rest": 0, "graphql": int(cost), "search": 0}
+
+    def validate_response(self, response: requests.Response) -> None:
+        """Validate HTTP response.
+
+        The graphql spec is a bit confusing around response codes
+        (https://github.com/graphql/graphql-over-http/blob/main/spec/GraphQLOverHTTP.md#response)
+        Github's API is a bit of a free adaptation of standards, so we
+        choose fail immediately on error here, so that something is logged
+        at the very minimum.
+
+        Args:
+            response: A `requests.Response`_ object.
+
+        Raises:
+            FatalAPIError: If the request is not retriable.
+            RetriableAPIError: If the request is retriable.
+        """
+        super().validate_response(response)
+        rj = response.json()
+        if "errors" in rj:
+            msg = rj["errors"]
+            if any(e.get("message") == "timedout" for e in msg if isinstance(e, dict)):
+                raise RetriableAPIError(f"Graphql error: {msg}", response)
+            # If partial data is present (partial success), log errors and continue.
+            # This handles e.g. FORBIDDEN errors on individual nodes in a paginated
+            # result where other nodes are accessible.
+            if rj.get("data") is not None:
+                self.logger.warning("Graphql partial errors (ignored): %s", msg)
+                return
+            raise FatalAPIError(f"Graphql error: {msg}", response)
