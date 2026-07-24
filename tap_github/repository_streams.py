@@ -307,7 +307,12 @@ class RepositoryStream(GitHubRestStream):
 
         all_records = list(super().get_records(context))
         if not all_records:
-            self.logger.info(f"[{self.name}:{partition_label}] round-robin summary: 0 repos returned by the API.")
+            # warning, not info: prod runs at warning level, and this
+            # summary is the only per-run signal of enumeration progress.
+            self.logger.warning(
+                f"[{self.name}:{partition_label}] round-robin summary: "
+                "0 repos returned by the API."
+            )
             return
 
         all_records.sort(key=lambda record: record["id"])
@@ -342,7 +347,10 @@ class RepositoryStream(GitHubRestStream):
                 self._write_state_message()
         finally:
             full_lap = processed >= len(ordered_records)
-            self.logger.info(
+            # warning, not info: prod runs at warning level, and this is the
+            # only per-run signal of enumeration progress - without it there
+            # is no visibility into how far a run got before crashing.
+            self.logger.warning(
                 f"[{self.name}:{partition_label}] round-robin summary: "
                 f"processed {processed}/{len(ordered_records)} repos in "
                 f"{time.monotonic() - started_at:.1f}s "
