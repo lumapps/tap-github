@@ -90,7 +90,23 @@ class GitHubRestStream(RESTStream):
         if context is not None and "org" in context:
             self.authenticator.set_organization(context["org"])
 
-        yield from super().get_records(context)
+        try:
+            yield from super().get_records(context)
+        except Exception as exc:
+            # singer_sdk's own Stream.sync() catch-all only logs "an unhandled
+            # error occurred while syncing '<stream>'" with no detail on why.
+            # Surface the real cause here before it propagates -
+            # FatalAPIError/RetriableAPIError already carry a rich message
+            # (HTTP status, GitHub-Request-Id, ...) that would otherwise be
+            # lost.
+            self.logger.error(
+                "%s failed for context=%s: %s: %s",
+                self.name,
+                context,
+                type(exc).__name__,
+                exc,
+            )
+            raise
 
     def _throttle_before_request(self) -> None:
         """Sleep if we're currently backing off from a secondary rate limit."""
