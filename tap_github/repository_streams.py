@@ -1463,6 +1463,9 @@ class PullRequestsStream(GitHubRestStream):
         return row
 
     def get_child_context(self, record: dict, context: Context | None) -> dict:
+        # head_sha is passed through so PullRequestCommitsStream can skip
+        # re-fetching a PR's commits when its head hasn't moved since the
+        # last sync - see PullRequestCommitsStream.get_records.
         if context:
             return {
                 "org": context["org"],
@@ -1470,6 +1473,7 @@ class PullRequestsStream(GitHubRestStream):
                 "repo_id": context["repo_id"],
                 "pull_number": record["number"],
                 "pull_id": record["id"],
+                "head_sha": record["head"]["sha"],
             }
         return {
             "pull_number": record["number"],
@@ -1477,6 +1481,7 @@ class PullRequestsStream(GitHubRestStream):
             "org": record["base"]["user"]["login"],
             "repo": record["base"]["repo"]["name"],
             "repo_id": record["base"]["repo"]["id"],
+            "head_sha": record["head"]["sha"],
         }
 
     schema = th.PropertiesList(
@@ -1583,6 +1588,35 @@ class PullRequestCommitsStream(GitHubRestStream):
     primary_keys: ClassVar[list[str]] = ["node_id"]
     parent_stream_type = PullRequestsStream
     state_partitioning_keys: ClassVar[list[str]] = ["repo", "org"]
+
+    def get_records(self, context: Context | None) -> Iterable[dict[str, Any]]:
+        """Skip re-fetching a PR's commits if its head hasn't moved.
+
+        A PR's commit list is immutable for a given head sha - it only
+        changes on a new push/rebase/force-push. PullRequestsStream
+        re-yields a PR whenever *anything* about it changes (a label, a
+        comment, a review...), which would otherwise force a full
+        re-fetch of its entire commit list every single time regardless
+        of whether the commits themselves changed. Tracking the
+        last-synced head sha per PR (state is partitioned per repo, so
+        this dict covers every PR in the repo) lets us skip that
+        re-fetch safely whenever nothing actually changed.
+        """
+        assert context is not None, f"Context cannot be empty for '{self.name}' stream"
+        pull_id = context.get("pull_id")
+        head_sha = context.get("head_sha")
+        synced_head_shas = self.get_context_state(context).setdefault(
+            "synced_head_shas", {}
+        )
+        if (
+            pull_id is not None
+            and head_sha is not None
+            and synced_head_shas.get(str(pull_id)) == head_sha
+        ):
+            return
+        yield from super().get_records(context)
+        if pull_id is not None and head_sha is not None:
+            synced_head_shas[str(pull_id)] = head_sha
 
     def get_child_context(self, record: dict, context: Context | None) -> dict:
         return {
