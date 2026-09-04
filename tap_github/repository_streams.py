@@ -1466,6 +1466,10 @@ class PullRequestsStream(GitHubRestStream):
         # head_sha is passed through so PullRequestCommitsStream can skip
         # re-fetching a PR's commits when its head hasn't moved since the
         # last sync - see PullRequestCommitsStream.get_records.
+        # node_id/state are passed through so ReviewsStream can cheaply
+        # probe (via GraphQL) whether a PR's review count has changed
+        # before paying for a full REST re-fetch - see
+        # ReviewsStream.get_records.
         if context:
             return {
                 "org": context["org"],
@@ -1474,6 +1478,8 @@ class PullRequestsStream(GitHubRestStream):
                 "pull_number": record["number"],
                 "pull_id": record["id"],
                 "head_sha": record["head"]["sha"],
+                "node_id": record["node_id"],
+                "state": record["state"],
             }
         return {
             "pull_number": record["number"],
@@ -1482,6 +1488,8 @@ class PullRequestsStream(GitHubRestStream):
             "repo": record["base"]["repo"]["name"],
             "repo_id": record["base"]["repo"]["id"],
             "head_sha": record["head"]["sha"],
+            "node_id": record["node_id"],
+            "state": record["state"],
         }
 
     schema = th.PropertiesList(
@@ -1773,6 +1781,54 @@ class PullRequestCommitDiffsStream(GitHubDiffStream):
     ).to_dict()
 
 
+class PullRequestReviewCountStream(GitHubGraphqlStream):
+    """Ad hoc, non-paginated GraphQL probe: has this PR's review count
+    changed since ReviewsStream last fetched it via REST?
+
+    Mirrors the pattern used by TempStream (see RepositoryStream.get_records
+    above) - reuses the parent stream's authenticator/rate-limit state, one
+    query, no pagination. Never instantiated directly by the tap's stream
+    graph; only used internally by ReviewsStream.get_records as a cheap
+    invariant check, the same role head_sha plays for
+    PullRequestCommitsStream.
+    """
+
+    name = "pull_request_review_count_check"
+    schema = th.PropertiesList(
+        th.Property(
+            "node",
+            th.ObjectType(
+                th.Property(
+                    "reviews",
+                    th.ObjectType(th.Property("totalCount", th.IntegerType)),
+                ),
+            ),
+        ),
+    ).to_dict()
+
+    def __init__(
+        self,
+        tap: Tap,
+        node_id: str,
+        *,
+        parent_authenticator: GitHubTokenAuthenticator | None = None,
+    ) -> None:
+        super().__init__(tap)
+        self.node_id = node_id
+        # Use parent's authenticator to maintain consistent auth state
+        # and rate limits (same reasoning as TempStream).
+        if parent_authenticator is not None:
+            self._authenticator = parent_authenticator
+
+    @property
+    def query(self) -> str:
+        return (
+            'query { node(id: "' + self.node_id + '") '
+            "{ ... on PullRequest { reviews { totalCount } } } "
+            "rateLimit { cost } }"
+        )
+
+
 class ReviewsStream(GitHubRestStream):
     name = "reviews"
     path = "/repos/{org}/{repo}/pulls/{pull_number}/reviews"
@@ -1780,6 +1836,83 @@ class ReviewsStream(GitHubRestStream):
     parent_stream_type = PullRequestsStream
     ignore_parent_replication_key = False
     state_partitioning_keys: ClassVar[list[str]] = ["repo", "org"]
+
+    def get_records(self, context: Context | None = None) -> Iterable[dict[str, Any]]:
+        """Skip re-fetching a PR's reviews if nothing has changed.
+
+        Unlike commits, reviews have no free invariant on the PR payload
+        (a review can be submitted with zero commit change) - so a cheap,
+        separate GraphQL probe (PullRequestReviewCountStream, on GitHub's
+        independent GraphQL rate-limit pool) is used to check whether the
+        review count moved since our last REST fetch. If the probe fails
+        for any reason, or there's no prior state, we fail safe and do the
+        full REST fetch - the probe only ever *skips* work, it never
+        invents a false "unchanged" when it can't be sure.
+
+        Once a PR has been observed non-open (closed/merged) with a stable
+        count across two consecutive checks, it's "retired" - skipped
+        entirely, including the probe itself - to shrink the working set
+        over time. This is a cost optimization only, not a correctness
+        requirement: a genuinely late review still bumps the PR's
+        updated_at, which re-surfaces it to this stream on a later run
+        (unless already retired - see the state schema note below for the
+        accepted trade-off). Reopening a PR always evicts it from
+        retirement immediately.
+        """
+        assert context is not None, f"Context cannot be empty for '{self.name}' stream"
+        pull_id = context.get("pull_id")
+        node_id = context.get("node_id")
+        pr_state = "open" if context.get("state") == "open" else "closed"
+
+        stream_state = self.get_context_state(context)
+        synced_reviews = stream_state.setdefault("synced_review_counts", {})
+        retired = stream_state.setdefault("retired_review_pull_ids", {})
+        key = str(pull_id)
+
+        if key in retired and pr_state == "open":
+            del retired[key]
+
+        if key in retired:
+            return
+
+        prior = synced_reviews.get(key)
+        new_count: int | None = None
+        probe_ok = False
+        if node_id is not None:
+            try:
+                check_stream = PullRequestReviewCountStream(
+                    self._tap, node_id, parent_authenticator=self.authenticator
+                )
+                for record in check_stream.request_records({}):
+                    node = record.get("node")
+                    new_count = node["reviews"]["totalCount"] if node else None
+                probe_ok = True
+            except Exception as exc:
+                self.logger.warning(
+                    "Review count probe failed for pull_id=%s (%s: %s); "
+                    "falling back to full REST fetch.",
+                    pull_id,
+                    type(exc).__name__,
+                    exc,
+                )
+
+        unchanged = (
+            probe_ok
+            and prior is not None
+            and new_count is not None
+            and new_count == prior["count"]
+        )
+
+        if unchanged:
+            if pr_state != "open" and prior.get("pr_state") != "open":
+                retired[key] = True
+            else:
+                synced_reviews[key] = {"count": new_count, "pr_state": pr_state}
+            return
+
+        fetched = list(super().get_records(context))
+        yield from fetched
+        synced_reviews[key] = {"count": len(fetched), "pr_state": pr_state}
 
     schema = th.PropertiesList(
         # Parent keys

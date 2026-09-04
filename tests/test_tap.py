@@ -8,12 +8,15 @@ import pytest
 from bs4 import BeautifulSoup
 from dateutil.parser import isoparse
 from requests import Response
-from singer_sdk.exceptions import RetriableAPIError
+from singer_sdk.exceptions import FatalAPIError, RetriableAPIError
 from singer_sdk.helpers import _catalog as cat_helpers
 from singer_sdk.singerlib import Catalog
 
 from tap_github.organization_streams import ProjectItemsStream
-from tap_github.repository_streams import GitHubRestStream
+from tap_github.repository_streams import (
+    GitHubRestStream,
+    PullRequestReviewCountStream,
+)
 from tap_github.scraping import parse_counter
 from tap_github.tap import TapGitHub
 
@@ -516,3 +519,347 @@ def test_web_tag_parse_counter():
         "html.parser",
     ).span
     assert parse_counter(tag) == 5_000
+
+
+# --- ReviewsStream incremental (GraphQL count-probe) tests -----------------
+#
+# ReviewsStream has no cheap invariant on the REST PR payload the way
+# PullRequestCommitsStream has head_sha, so a separate GraphQL probe
+# (PullRequestReviewCountStream) is used to decide whether to skip the full
+# REST re-fetch. These tests mock at the same two seams already used
+# elsewhere in this file: GitHubRestStream.get_records for the REST leg
+# (see test_pull_requests_stream_skips_repos_with_pull_requests_disabled
+# above), and PullRequestReviewCountStream.request_records for the new
+# GraphQL leg.
+
+
+def _reviews_context(**overrides):
+    context = {
+        "org": "shop",
+        "repo": "widgets",
+        "repo_id": 111,
+        "pull_number": 42,
+        "pull_id": 999,
+        "node_id": "PR_kwDOtest",
+        "state": "open",
+    }
+    context.update(overrides)
+    return context
+
+
+def _probe_returning(total_count):
+    if total_count is None:
+        return iter([{"node": None}])
+    return iter([{"node": {"reviews": {"totalCount": total_count}}}])
+
+
+def test_reviews_stream_skips_rest_when_count_unchanged(repo_list_config):  # noqa: F811
+    """A PR whose review count hasn't moved should not trigger a REST fetch."""
+    tap = TapGitHub(config=repo_list_config)
+    reviews_stream = tap.streams["reviews"]
+    context = _reviews_context()
+
+    stream_state = reviews_stream.get_context_state(context)
+    stream_state.setdefault("synced_review_counts", {})["999"] = {
+        "count": 2,
+        "pr_state": "open",
+    }
+
+    with (
+        patch.object(
+            PullRequestReviewCountStream,
+            "request_records",
+            return_value=_probe_returning(2),
+        ) as probe,
+        patch.object(GitHubRestStream, "get_records") as rest,
+    ):
+        records = list(reviews_stream.get_records(context))
+
+    assert records == []
+    probe.assert_called_once()
+    rest.assert_not_called()
+    assert stream_state["synced_review_counts"]["999"] == {
+        "count": 2,
+        "pr_state": "open",
+    }
+
+
+def test_reviews_stream_fetches_rest_when_count_changed(repo_list_config):  # noqa: F811
+    """A PR whose review count moved must be re-fetched via REST, and the
+    stored count must come from the actual REST rows - not the raw GraphQL
+    number - so the two are deliberately made to disagree here."""
+    tap = TapGitHub(config=repo_list_config)
+    reviews_stream = tap.streams["reviews"]
+    context = _reviews_context()
+
+    stream_state = reviews_stream.get_context_state(context)
+    stream_state.setdefault("synced_review_counts", {})["999"] = {
+        "count": 2,
+        "pr_state": "open",
+    }
+
+    fake_rows = [{"id": 1}, {"id": 2}, {"id": 3}]
+    with (
+        patch.object(
+            PullRequestReviewCountStream,
+            "request_records",
+            return_value=_probe_returning(5),
+        ) as probe,
+        patch.object(
+            GitHubRestStream, "get_records", return_value=iter(fake_rows)
+        ) as rest,
+    ):
+        records = list(reviews_stream.get_records(context))
+
+    assert records == fake_rows
+    probe.assert_called_once()
+    rest.assert_called_once()
+    # stored count is REST's row count (3), not GraphQL's totalCount (5)
+    assert stream_state["synced_review_counts"]["999"] == {
+        "count": 3,
+        "pr_state": "open",
+    }
+
+
+def test_reviews_stream_first_sync_always_fetches_rest(repo_list_config):  # noqa: F811
+    """No prior state for a PR means REST is fetched unconditionally,
+    regardless of what the probe reports, and state is bootstrapped."""
+    tap = TapGitHub(config=repo_list_config)
+    reviews_stream = tap.streams["reviews"]
+    context = _reviews_context()
+
+    fake_rows = [{"id": 1}]
+    with (
+        patch.object(
+            PullRequestReviewCountStream,
+            "request_records",
+            return_value=_probe_returning(1),
+        ),
+        patch.object(
+            GitHubRestStream, "get_records", return_value=iter(fake_rows)
+        ) as rest,
+    ):
+        records = list(reviews_stream.get_records(context))
+
+    assert records == fake_rows
+    rest.assert_called_once()
+    state = reviews_stream.get_context_state(context)
+    assert state["synced_review_counts"]["999"] == {"count": 1, "pr_state": "open"}
+
+
+def test_reviews_stream_missing_node_id_falls_back_to_rest(repo_list_config):  # noqa: F811
+    """Defensive path: if PullRequestsStream ever fails to supply node_id,
+    the probe must never be attempted, and REST must still run."""
+    tap = TapGitHub(config=repo_list_config)
+    reviews_stream = tap.streams["reviews"]
+    context = _reviews_context(node_id=None)
+
+    stream_state = reviews_stream.get_context_state(context)
+    stream_state.setdefault("synced_review_counts", {})["999"] = {
+        "count": 2,
+        "pr_state": "open",
+    }
+
+    with (
+        patch.object(PullRequestReviewCountStream, "request_records") as probe,
+        patch.object(GitHubRestStream, "get_records", return_value=iter([])) as rest,
+    ):
+        list(reviews_stream.get_records(context))
+
+    probe.assert_not_called()
+    rest.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        RetriableAPIError("boom", Response()),
+        FatalAPIError("boom"),
+        TimeoutError("boom"),
+    ],
+)
+def test_reviews_stream_probe_error_falls_back_to_rest(repo_list_config, exc):  # noqa: F811
+    """A failing probe must never be mistaken for "unchanged" - it must
+    fail safe to a full REST fetch, whatever the error type."""
+    tap = TapGitHub(config=repo_list_config)
+    reviews_stream = tap.streams["reviews"]
+    context = _reviews_context()
+
+    stream_state = reviews_stream.get_context_state(context)
+    stream_state.setdefault("synced_review_counts", {})["999"] = {
+        "count": 2,
+        "pr_state": "open",
+    }
+
+    fake_rows = [{"id": 1}, {"id": 2}]
+    with (
+        patch.object(PullRequestReviewCountStream, "request_records", side_effect=exc),
+        patch.object(
+            GitHubRestStream, "get_records", return_value=iter(fake_rows)
+        ) as rest,
+    ):
+        records = list(reviews_stream.get_records(context))
+
+    assert records == fake_rows
+    rest.assert_called_once()
+    assert stream_state["synced_review_counts"]["999"] == {
+        "count": 2,
+        "pr_state": "open",
+    }
+
+
+def test_reviews_stream_null_node_falls_back_to_rest(repo_list_config):  # noqa: F811
+    """GraphQL returning {"node": None} (inaccessible/deleted node) must be
+    treated as unknown/changed, not a false "unchanged"."""
+    tap = TapGitHub(config=repo_list_config)
+    reviews_stream = tap.streams["reviews"]
+    context = _reviews_context()
+
+    stream_state = reviews_stream.get_context_state(context)
+    stream_state.setdefault("synced_review_counts", {})["999"] = {
+        "count": 2,
+        "pr_state": "open",
+    }
+
+    fake_rows = [{"id": 1}]
+    with (
+        patch.object(
+            PullRequestReviewCountStream,
+            "request_records",
+            return_value=_probe_returning(None),
+        ),
+        patch.object(
+            GitHubRestStream, "get_records", return_value=iter(fake_rows)
+        ) as rest,
+    ):
+        records = list(reviews_stream.get_records(context))
+
+    assert records == fake_rows
+    rest.assert_called_once()
+
+
+def test_reviews_stream_retired_pr_skips_probe_and_rest(repo_list_config):  # noqa: F811
+    """A PR already retired must skip both the probe and REST entirely."""
+    tap = TapGitHub(config=repo_list_config)
+    reviews_stream = tap.streams["reviews"]
+    context = _reviews_context(state="closed")
+
+    stream_state = reviews_stream.get_context_state(context)
+    stream_state.setdefault("retired_review_pull_ids", {})["999"] = True
+
+    with (
+        patch.object(PullRequestReviewCountStream, "request_records") as probe,
+        patch.object(GitHubRestStream, "get_records") as rest,
+    ):
+        records = list(reviews_stream.get_records(context))
+
+    assert records == []
+    probe.assert_not_called()
+    rest.assert_not_called()
+
+
+def test_reviews_stream_retirement_requires_two_stable_closed_observations(
+    repo_list_config,  # noqa: F811
+):
+    """Retirement only kicks in after two *consecutive* unchanged
+    observations while the PR is non-open - not after just one."""
+    tap = TapGitHub(config=repo_list_config)
+    reviews_stream = tap.streams["reviews"]
+    context = _reviews_context(state="closed")
+
+    stream_state = reviews_stream.get_context_state(context)
+    # Prior observation was while the PR was still open.
+    stream_state.setdefault("synced_review_counts", {})["999"] = {
+        "count": 4,
+        "pr_state": "open",
+    }
+
+    # side_effect (not return_value) so each call gets a fresh, unconsumed
+    # iterator - return_value would hand back the same exhausted generator
+    # on the second get_records call.
+    with patch.object(
+        PullRequestReviewCountStream,
+        "request_records",
+        side_effect=lambda *a, **kw: _probe_returning(4),
+    ):
+        with patch.object(GitHubRestStream, "get_records") as rest:
+            list(reviews_stream.get_records(context))
+        rest.assert_not_called()  # unchanged -> REST still skipped
+        assert "999" not in stream_state.get("retired_review_pull_ids", {})
+        assert stream_state["synced_review_counts"]["999"]["pr_state"] == "closed"
+
+        with patch.object(GitHubRestStream, "get_records") as rest:
+            list(reviews_stream.get_records(context))
+        rest.assert_not_called()
+        assert stream_state["retired_review_pull_ids"]["999"] is True
+
+
+def test_reviews_stream_reopened_pr_evicts_retirement(repo_list_config):  # noqa: F811
+    """Reopening a PR must immediately evict it from retirement and resume
+    normal probe/REST handling in the same call."""
+    tap = TapGitHub(config=repo_list_config)
+    reviews_stream = tap.streams["reviews"]
+    context = _reviews_context(state="open")
+
+    stream_state = reviews_stream.get_context_state(context)
+    stream_state.setdefault("retired_review_pull_ids", {})["999"] = True
+
+    fake_rows = [{"id": 1}, {"id": 2}]
+    with (
+        patch.object(
+            PullRequestReviewCountStream,
+            "request_records",
+            return_value=_probe_returning(2),
+        ),
+        patch.object(
+            GitHubRestStream, "get_records", return_value=iter(fake_rows)
+        ) as rest,
+    ):
+        records = list(reviews_stream.get_records(context))
+
+    assert records == fake_rows
+    rest.assert_called_once()
+    assert "999" not in stream_state["retired_review_pull_ids"]
+
+
+def test_reviews_stream_cross_pr_state_isolation(repo_list_config):  # noqa: F811
+    """Two PRs that coincidentally share the same review count must not
+    cross-contaminate: the one with no prior baseline of its own must
+    still trigger a REST fetch, regardless of a sibling PR's stored count."""
+    tap = TapGitHub(config=repo_list_config)
+    reviews_stream = tap.streams["reviews"]
+    context_a = _reviews_context(pull_id=111, pull_number=1, node_id="PR_a")
+    context_b = _reviews_context(pull_id=222, pull_number=2, node_id="PR_b")
+
+    stream_state = reviews_stream.get_context_state(context_a)
+    stream_state.setdefault("synced_review_counts", {})["111"] = {
+        "count": 3,
+        "pr_state": "open",
+    }
+    assert (
+        reviews_stream.get_context_state(context_b) is stream_state
+    )  # same (org, repo)
+
+    fake_rows = [{"id": 1}, {"id": 2}, {"id": 3}]
+    with (
+        patch.object(
+            PullRequestReviewCountStream,
+            "request_records",
+            return_value=_probe_returning(3),
+        ),
+        patch.object(
+            GitHubRestStream, "get_records", return_value=iter(fake_rows)
+        ) as rest,
+    ):
+        records = list(reviews_stream.get_records(context_b))
+
+    assert records == fake_rows
+    rest.assert_called_once()
+    assert stream_state["synced_review_counts"]["111"] == {
+        "count": 3,
+        "pr_state": "open",
+    }
+    assert stream_state["synced_review_counts"]["222"] == {
+        "count": 3,
+        "pr_state": "open",
+    }
