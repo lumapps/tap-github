@@ -11,6 +11,7 @@ from requests import Response
 from singer_sdk.exceptions import FatalAPIError, RetriableAPIError
 from singer_sdk.helpers import _catalog as cat_helpers
 from singer_sdk.singerlib import Catalog
+from singer_sdk.streams import RESTStream
 
 from tap_github.organization_streams import ProjectItemsStream
 from tap_github.repository_streams import (
@@ -863,3 +864,100 @@ def test_reviews_stream_cross_pr_state_isolation(repo_list_config):  # noqa: F81
         "count": 3,
         "pr_state": "open",
     }
+
+
+# ---------------------------------------------------------------------------
+# Fake-since record filter (GitHubRestStream.request_records)
+#
+# Streams that page with the fake `since` parameter stop at page level, so
+# every fetched page is emitted in full. The filter in request_records drops
+# the records older than the starting timestamp. These tests mock the SDK leg
+# (RESTStream.request_records) and check what the GitHub layer lets through.
+
+
+def _pr_rows(*updated_at):
+    return [
+        {"id": index, "number": index, "updated_at": value}
+        for index, value in enumerate(updated_at, start=1)
+    ]
+
+
+def _pr_context():
+    return {"org": "shop", "repo": "widgets", "repo_id": 111}
+
+
+def test_fake_since_stream_drops_records_older_than_bookmark(repo_list_config):  # noqa: F811
+    """Records before the bookmark are dropped, records at or after it are kept."""
+    # start_date must be older than the bookmark, else the SDK takes the newer one.
+    config = {**repo_list_config, "start_date": "2026-10-01T00:00:00Z"}
+    tap = TapGitHub(config=config)
+    stream = tap.streams["pull_requests"]
+    context = _pr_context()
+    state = stream.get_context_state(context)
+    state["replication_key"] = "updated_at"
+    state["replication_key_value"] = "2026-11-01T00:00:00Z"
+    # The SDK sync loop seeds the starting value from the bookmark (or
+    # start_date) right before get_records; do the same here.
+    stream._write_starting_replication_value(context)
+    rows = _pr_rows(
+        "2026-11-05T10:00:00Z",
+        "2026-11-01T00:00:00Z",
+        "2026-10-20T08:00:00Z",
+    )
+
+    with patch.object(RESTStream, "request_records", return_value=iter(rows)):
+        kept = list(stream.request_records(context))
+
+    assert [row["id"] for row in kept] == [1, 2]
+
+
+def test_fake_since_stream_keeps_everything_without_bookmark_or_start_date(
+    repo_list_config,  # noqa: F811
+):
+    """A first sync with no start_date must still load the full history."""
+    config = {k: v for k, v in repo_list_config.items() if k != "start_date"}
+    tap = TapGitHub(config=config)
+    stream = tap.streams["pull_requests"]
+    context = _pr_context()
+    stream._write_starting_replication_value(context)
+    rows = _pr_rows("2026-11-05T10:00:00Z", "2015-01-01T00:00:00Z")
+
+    with patch.object(RESTStream, "request_records", return_value=iter(rows)):
+        kept = list(stream.request_records(context))
+
+    assert [row["id"] for row in kept] == [1, 2]
+
+
+def test_fake_since_stream_applies_start_date_on_first_sync(repo_list_config):  # noqa: F811
+    """Without a bookmark, start_date is the threshold."""
+    config = {**repo_list_config, "start_date": "2026-11-01T00:00:00Z"}
+    tap = TapGitHub(config=config)
+    stream = tap.streams["pull_requests"]
+    context = _pr_context()
+    stream._write_starting_replication_value(context)
+    rows = _pr_rows("2026-11-05T10:00:00Z", "2026-10-20T08:00:00Z")
+
+    with patch.object(RESTStream, "request_records", return_value=iter(rows)):
+        kept = list(stream.request_records(context))
+
+    assert [row["id"] for row in kept] == [1]
+
+
+def test_real_since_stream_is_not_filtered(repo_list_config):  # noqa: F811
+    """Streams with a real `since` parameter (commits) keep every record."""
+    tap = TapGitHub(config=repo_list_config)
+    stream = tap.streams["commits"]
+    context = _pr_context()
+    state = stream.get_context_state(context)
+    state["replication_key"] = "commit_timestamp"
+    state["replication_key_value"] = "2026-11-01T00:00:00Z"
+    stream._write_starting_replication_value(context)
+    rows = [
+        {"sha": "old", "commit": {"committer": {"date": "2020-01-01T00:00:00Z"}}},
+        {"sha": "new", "commit": {"committer": {"date": "2026-11-05T00:00:00Z"}}},
+    ]
+
+    with patch.object(RESTStream, "request_records", return_value=iter(rows)):
+        kept = list(stream.request_records(context))
+
+    assert [row["sha"] for row in kept] == ["old", "new"]
