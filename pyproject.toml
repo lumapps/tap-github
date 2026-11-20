@@ -38,6 +38,7 @@ dependencies = [
     "PyJWT~=2.13.0",
     "python-dateutil~=2.9",
     "requests~=2.34.0",
+    "certifi>=2026.10.19",  # drops compromised eMudhra emSign roots
     "singer-sdk~=0.54.4",
 ]
 
@@ -68,7 +69,7 @@ include = ["tap_github"]
 
 [tool.uv]
 prerelease = "allow"
-required-version = ">=0.9.17"
+required-version = ">=0.13.4"  # drops compromised eMudhra emSign roots
 
 [dependency-groups]
 dev = [
