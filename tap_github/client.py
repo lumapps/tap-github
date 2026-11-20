@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime
 import email.utils
 import inspect
 import random
@@ -416,6 +417,64 @@ class GitHubRestStream(RESTStream):
                 results = [resp_json]
 
         yield from results
+
+    def request_records(self, context: Context | None) -> Iterable[dict]:
+        """Request records and drop the ones older than the bookmark.
+
+        Streams that page with the fake ``since`` parameter walk back in time
+        page by page and stop after the first page that ends before the
+        bookmark. Every record of every fetched page is emitted, so each sync
+        re-emits at least one full page per partition, including records that
+        did not change since the last sync. Those records then also trigger the
+        child streams. This filter keeps only the records at or after the
+        starting timestamp. Streams with a real ``since`` parameter, and first
+        syncs without a bookmark or ``start_date``, are left untouched.
+        """
+        records = super().request_records(context)
+        since = self._fake_since_threshold(context)
+        if since is None:
+            yield from records
+            return
+
+        kept = 0
+        dropped = 0
+        for record in records:
+            value = self._fake_since_record_value(record)
+            if value is not None and parse(value) < since:
+                dropped += 1
+                continue
+            kept += 1
+            yield record
+
+        if dropped:
+            self.logger.info(
+                f"[{self.name}] fake-since filter: kept {kept}, "
+                f"dropped {dropped} records older than {since.isoformat()} "
+                f"for context {context}"
+            )
+
+    def _fake_since_threshold(
+        self, context: Context | None
+    ) -> datetime.datetime | None:
+        """Return the bookmark to filter on, or None when no filter applies."""
+        if not (
+            self.replication_key
+            and self.use_fake_since_parameter
+            and self.is_timestamp_replication_key
+        ):
+            return None
+        since = self.get_starting_timestamp(context)
+        if since is None:
+            return None
+        if since.tzinfo is None:
+            since = since.replace(tzinfo=datetime.timezone.utc)
+        return since
+
+    def _fake_since_record_value(self, record: dict) -> str | None:
+        """Return the replication value of a record, as the API serialises it."""
+        if self.replication_key == "commit_timestamp":
+            return record.get("commit", {}).get("committer", {}).get("date")
+        return record.get(self.replication_key)
 
     def post_process(self, row: dict, context: Context | None = None) -> dict:
         """Add `repo_id` by default to all streams."""
